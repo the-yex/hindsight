@@ -517,3 +517,32 @@ def decode_video_frames(data: bytes, *, fps: int = 1, side: int = 448) -> np.nda
 def l2_normalize(vector: list[float]) -> list[float]:
     norm = math.sqrt(sum(v * v for v in vector)) or 1.0
     return [v / norm for v in vector]
+
+
+#: Longest side of the picture a decision model judges a hit by: Jev refuses larger images.
+JUDGE_SIDE = 1024
+
+
+def judge_picture(data: bytes, modality: Literal["image", "video"]) -> bytes:
+    """A JPEG a decision model judges a media hit by: an image or PDF page at most ``JUDGE_SIDE`` a side;
+    a video window as a 2x2 grid of four evenly spaced frames (decision models take images, not video),
+    each frame padded to a square so the grid is always ``JUDGE_SIDE`` x ``JUDGE_SIDE``."""
+    if modality == "video":
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as f:
+            f.write(data)
+            f.flush()
+            duration = probe(f.name).duration or 1.0
+            half = JUDGE_SIDE // 2
+            grid = f"fps=4/{duration:.3f},scale={half}:{half}:force_original_aspect_ratio=decrease"
+            grid += f",pad={half}:{half}:-1:-1,tile=2x2"
+            return _run(
+                [_ffmpeg(), "-loglevel", "error", "-i", f.name, "-vf", grid, "-frames:v", "1", "-q:v", "4"]
+                + ["-f", "image2", "-c:v", "mjpeg", "-"]
+            )
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(data)).convert("RGB")
+    image.thumbnail((JUDGE_SIDE, JUDGE_SIDE))
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=85)
+    return out.getvalue()

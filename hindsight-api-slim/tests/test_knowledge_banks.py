@@ -7,6 +7,7 @@ hindsight-dev/benchmarks/knowledge_banks_mm.
 """
 
 import asyncio
+import base64
 import io
 import json
 import math
@@ -18,6 +19,9 @@ from dataclasses import replace
 import pytest
 from PIL import Image
 
+from hindsight_api.engine.aiohttp_session import UpstreamHTTPError
+from hindsight_api.engine.decision_model import DecisionAnswer, DecisionModel
+from hindsight_api.engine.search.decision_reranker import DecisionModelReranker
 from hindsight_api.engine.token_encoding import count_tokens
 from hindsight_api.knowledge import media
 from hindsight_api.knowledge.embedders import EmbedInput, KnowledgeEmbedder
@@ -568,6 +572,88 @@ async def test_reflect_recall_tool_returns_linked_documents_as_the_authority(api
     internal = await memory.recall_async(mem_bank, "red", request_context=request_context)
     assert internal.documents is None
     await memory.delete_bank(mem_bank, request_context=request_context)
+
+
+class _JudgeByPicture:
+    """A decision model that judges each hit by the picture it is shown: the bluer, the more relevant."""
+
+    max_request_tokens = 26_000
+    tokenizer = None
+    rerank_interface = DecisionModel.rerank_interface
+
+    def __init__(self) -> None:
+        self.pictures: dict[str, Image.Image] = {}
+        self.texts: list[str] = []
+
+    async def ask_all(self, state, questions, *, scope, assets=None):
+        answers = {}
+        for key, question in questions.items():
+            memory = question.instructions["memory"]
+            name = next((n for n in assets or {} if n in memory), None)
+            if name is None:
+                self.texts.append(memory)
+                answers[key] = DecisionAnswer(noul=0.0)
+                continue
+            assert assets[name].format == "jpg"
+            picture = Image.open(io.BytesIO(base64.b64decode(assets[name].data_base64))).convert("RGB")
+            self.pictures[name] = picture
+            red, _green, blue = picture.resize((1, 1)).getpixel((0, 0))
+            answers[key] = DecisionAnswer(noul=blue / 255)
+        return answers
+
+
+@pytest.fixture
+def judge(memory):
+    service = get_knowledge_service(memory)
+    previous = service._reranker, service._reranker_resolved
+    service._reranker, service._reranker_resolved = DecisionModelReranker(_JudgeByPicture()), True  # type: ignore[arg-type]
+    yield service._reranker._client
+    service._reranker, service._reranker_resolved = previous
+
+
+async def test_a_decision_model_reranks_search_hits_by_their_pictures(api_client, kb, judge):
+    await _upload(
+        api_client,
+        kb,
+        [
+            ("manual.pdf", _pdf((250, 10, 10), (10, 10, 250)), "application/pdf"),
+            ("demo.mp4", _tone(6, video=True), "video/mp4"),
+        ],
+        [{"document_id": "manual"}, {"document_id": "demo"}],
+    )
+    r = await api_client.post(
+        f"{KB}/{kb}/ingest",
+        json={"items": [{"document_id": "faq", "text": "red pages and blue pages", "filename": "faq.md"}]},
+    )
+    assert r.status_code == 200, r.text
+
+    hits = await _search(api_client, kb, query="red")
+    # The embedder puts the red page first; the judge, shown each page's picture, prefers the blue one.
+    assert (hits[0]["document_id"], hits[0]["page"]) == ("manual", 2)
+    assert judge.texts == ["red pages and blue pages"]  # a text hit is judged by its text, with no picture
+    sizes = sorted(picture.size for picture in judge.pictures.values())
+    # Two pages at most 1024 a side, and the clip as one 2x2 grid of its frames.
+    assert len(sizes) == 3 and (1024, 1024) in sizes and all(max(size) <= 1024 for size in sizes)
+
+    # A search with no text is not reranked: the questions ask about the query's words.
+    judge.pictures.clear()
+    await _search(api_client, kb, query_image=base64.b64encode(_png((0, 0, 255))).decode())
+    assert judge.pictures == {}
+
+
+async def test_a_failing_decision_model_is_reported_as_itself(api_client, kb, judge, monkeypatch):
+    r = await api_client.post(
+        f"{KB}/{kb}/ingest",
+        json={"items": [{"document_id": d, "text": f"{d} guide"} for d in ("keys", "billing")]},
+    )
+    assert r.status_code == 200, r.text
+
+    async def down(*args, **kwargs):
+        raise UpstreamHTTPError(502, "bad gateway", {}, "http://decisions")
+
+    monkeypatch.setattr(judge, "ask_all", down)
+    r = await api_client.post(f"{KB}/{kb}/search", json={"query": "guide"})
+    assert r.status_code == 503 and "decision model" in r.json()["detail"], r.text
 
 
 async def test_bank_list_pages_and_searches_by_id(api_client, fake_embedder):

@@ -294,6 +294,7 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
                 answers[question_id] = {"type": "choice", "choice": pick, "probabilities": probabilities}
             return JSONResponse({"model": "stub", "answers": answers, "usage": {"input_tokens": 1, "output_tokens": 1}})
 
+        stubs.rerank.assets.append({name: asset["format"] for name, asset in body.get("assets", {}).items()})
         for question_id, question in body["questions"].items():
             if question["type"] == "noul" and "memory_a" in question["instructions"]:
                 instructions = question["instructions"]

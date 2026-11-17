@@ -12,6 +12,7 @@ embeds the query into the same space and returns the nearest passages.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import itertools
 import json
@@ -26,14 +27,19 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
+import aiohttp
+
 from ..config import get_config
 from ..engine import bank_aliases
+from ..engine.aiohttp_session import UpstreamHTTPError
 from ..engine.db_utils import acquire_with_retry
+from ..engine.decision_model import DecisionAsset, DecisionRefusedError
 from ..engine.operation_metadata import KnowledgeIngestChildMetadata, KnowledgeIngestParentMetadata
 from ..engine.response_models import KnowledgeDocumentHit
 from ..engine.retain import bank_utils
 from ..engine.retain import timing as _timing
 from ..engine.schema import fq_table
+from ..engine.search.decision_reranker import DecisionModelReranker
 from ..engine.storage import bank_storage_prefix, key_segment
 from ..engine.token_encoding import count_tokens
 from ..extensions.operation_validator import (
@@ -524,6 +530,8 @@ class KnowledgeService:
         self._engine = engine
         self._embedder: KnowledgeEmbedder | None = None
         self._store: KnowledgeStore | None = None
+        self._reranker: DecisionModelReranker | None = None
+        self._reranker_resolved = False
 
     # --- wiring -----------------------------------------------------------------------------
 
@@ -532,6 +540,15 @@ class KnowledgeService:
         if self._embedder is None:
             self._embedder = create_knowledge_embedder(get_config(), self._engine.embeddings)
         return self._embedder
+
+    @property
+    def reranker(self) -> DecisionModelReranker | None:
+        """Recall's decision reranker on the knowledge decision model, or None when none is set up for it."""
+        if not self._reranker_resolved:
+            setup = get_config().decision_model_config("knowledge")
+            self._reranker = DecisionModelReranker.from_config(setup) if setup else None
+            self._reranker_resolved = True
+        return self._reranker
 
     @property
     def store(self) -> KnowledgeStore:
@@ -1780,6 +1797,8 @@ class KnowledgeService:
             vector = await embedding
             async with _timing.timed("store.search"):
                 hits = await self._search(bank_id, request, vector, trace)
+            async with _timing.timed("rerank"):
+                hits = await self._reranked(request, hits)
             async with _timing.timed("context"):
                 budgeted = await self._within_budget(bank_id, hits, request.max_tokens, trace)
             if trace is not None:
@@ -1842,6 +1861,44 @@ class KnowledgeService:
             keyword_weight=get_config().knowledge_keyword_weight,
             trace=trace.store if trace is not None else None,
         )
+
+    async def _reranked(self, request: SearchRequest, hits: list[SearchHit]) -> list[SearchHit]:
+        """``hits`` with the best ``knowledge_decision_model_candidates`` reordered by the decision model,
+        as recall's decision reranker orders its pool; the rest keep the search's order. An image, PDF page
+        or video hit is judged by its picture (``media.judge_picture``) along with any text it holds. Only
+        a search with text is reranked: the questions ask about it."""
+        reranker = self.reranker
+        query = (request.query or "").strip()
+        head = hits[: get_config().knowledge_decision_model_candidates]
+        if reranker is None or not query or len(head) < 2:
+            return hits
+        pictures = await asyncio.gather(*(self._picture(hit) for hit in head))
+        docs: list[str] = []
+        assets: dict[str, DecisionAsset] = {}
+        for slot, (hit, picture) in enumerate(zip(head, pictures, strict=True)):
+            text = hit.passage.text or ""
+            if picture is None:
+                docs.append(text)
+                continue
+            # The placeholder leads: a long page text is capped from its end, never cutting it off.
+            key = f"hs-kb-hit-{slot:04d}"
+            assets[key] = DecisionAsset(format="jpg", data_base64=base64.b64encode(picture).decode())
+            docs.append(f"{key}\n\n{text}" if text else key)
+        try:
+            scores = await reranker.rank(query, docs, assets)
+        except (aiohttp.ClientError, UpstreamHTTPError, DecisionRefusedError, ValueError) as exc:
+            # Named for what failed: the routes report any other upstream error as the embedder's outage.
+            raise KnowledgeBankError(f"knowledge decision model unavailable: {exc}", 503) from exc
+        order = sorted(range(len(head)), key=lambda slot: -scores[slot])
+        return [head[slot] for slot in order] + hits[len(head) :]
+
+    async def _picture(self, hit: SearchHit) -> bytes | None:
+        """The JPEG a decision model judges a media hit by, or None for a hit judged by its text (text, audio)."""
+        modality = hit.passage.modality
+        if modality not in ("image", "video") or not hit.passage.media_key:
+            return None
+        data = await self._engine._file_storage.retrieve(hit.passage.media_key)
+        return await asyncio.to_thread(media.judge_picture, data, modality)
 
     async def _within_budget(
         self, bank_id: str, hits: list[SearchHit], max_tokens: int, trace: SearchTrace | None = None

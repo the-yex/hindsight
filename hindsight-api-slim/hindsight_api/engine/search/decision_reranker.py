@@ -21,7 +21,7 @@ import numpy as np
 
 from ...config import DecisionModelConfig
 from ..cross_encoder import CrossEncoderModel
-from ..decision_model import DecisionModel, DecisionQuestion
+from ..decision_model import DecisionAsset, DecisionModel, DecisionQuestion
 from ..decision_rerank_interface import ALIKE_FROM
 
 PROVIDER_NAME = "decision_model"
@@ -99,8 +99,25 @@ class DecisionModelReranker(CrossEncoderModel):
     async def initialize(self) -> None:
         pass
 
-    async def _rerank(self, query: str, docs: list[str], indices: list[int], scores: list[float]) -> None:
-        """Scores ``indices`` by position, best first."""
+    async def rank(self, query: str, docs: list[str], assets: dict[str, DecisionAsset] | None = None) -> list[float]:
+        """``docs`` scored by position, best first, as recall ranks its pool: knowledge-bank search's entry.
+
+        ``assets`` are the images some docs look at: a doc holding an asset's key is judged with that
+        image in front of the model (a page, a photo, a video's frames)."""
+        scores = [0.0] * len(docs)
+        await self._rerank(query, docs, list(range(len(docs))), scores, assets, scope="decision_knowledge_rerank")
+        return scores
+
+    async def _rerank(
+        self,
+        query: str,
+        docs: list[str],
+        indices: list[int],
+        scores: list[float],
+        assets: dict[str, DecisionAsset] | None = None,
+        scope: str = "decision_recall_rerank",
+    ) -> None:
+        """Scores ``indices`` by position, best first; traced under ``scope``."""
         rerank = self._client.rerank_interface()
         options = rerank_options.get()
         subset = [docs[index] for index in indices]
@@ -109,7 +126,7 @@ class DecisionModelReranker(CrossEncoderModel):
         state = rerank.state(query, rerank_shared_context.get())
         # Every memory is capped (see DecisionRerank.questions), so no single question can
         # outgrow the window: a failed request now raises instead of ranking its candidates last.
-        answers = await self._client.ask_all(state, questions, scope="decision_recall_rerank")
+        answers = await self._client.ask_all(state, questions, scope=scope, assets=assets)
         # Stable on the caller's input order, so equal answers keep their RRF order.
         nouls = [answers[question.key].noul if question.key in answers else None for question in asked]
         ranked = rerank.pruned(nouls) if options.prune else rerank.scores(nouls)
