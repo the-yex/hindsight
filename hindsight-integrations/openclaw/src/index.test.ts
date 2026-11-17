@@ -31,6 +31,8 @@ import {
   isEphemeralOperationalText,
   deriveBankId,
   normalizeRetainTags,
+  resolveScopeTags,
+  recallTagFilter,
   extractInlineRetainTags,
   stripInlineRetainTags,
   stripInlineTimestampPrefix,
@@ -472,6 +474,58 @@ describe("normalizeRetainTags", () => {
       "source_system:openclaw",
       "agent:main",
     ]);
+  });
+});
+
+describe("resolveScopeTags", () => {
+  it("substitutes placeholders and drops tags whose placeholder is unknown", () => {
+    expect(
+      resolveScopeTags(
+        ["speaker:{sender}", "agent:{agent}", "static:tag", "bad:{missing}"],
+        { sender: "wxid_928wb844upw522", agent: "main" }
+      )
+    ).toEqual(["speaker:wxid_928wb844upw522", "agent:main", "static:tag"]);
+  });
+
+  it("sanitizes whitespace and tag-breaking characters in values", () => {
+    expect(resolveScopeTags(["name:{sender}"], { sender: "Zhang San/李四" })).toEqual([
+      "name:Zhang_San_李四",
+    ]);
+  });
+
+  it("keeps glob characters that Hindsight tags support", () => {
+    expect(resolveScopeTags(["topic:{channel}"], { channel: "group:*" })).toEqual([
+      "topic:group:*",
+    ]);
+  });
+
+  it("returns an empty list when nothing is configured", () => {
+    expect(resolveScopeTags(undefined, { sender: "x" })).toEqual([]);
+  });
+});
+
+describe("recallTagFilter", () => {
+  it("returns undefined when recallTags is empty", () => {
+    expect(recallTagFilter({ senderId: "wxid_1" }, {})).toBeUndefined();
+  });
+
+  it("resolves recallTags from the session context and defaults to match any", () => {
+    expect(
+      recallTagFilter(
+        {
+          messageProvider: "wechat-bridge",
+          channelId: "direct:wxid_928wb844upw522",
+          senderId: "wxid_928wb844upw522",
+        },
+        { recallTags: ["speaker:{sender}"] }
+      )
+    ).toEqual({ tags: ["speaker:wxid_928wb844upw522"], tagsMatch: "any" });
+  });
+
+  it("honours recallTagsMatch", () => {
+    expect(
+      recallTagFilter({ senderId: "wxid_1" }, { recallTags: ["speaker:{sender}"], recallTagsMatch: "all" })
+    ).toEqual({ tags: ["speaker:wxid_1"], tagsMatch: "all" });
   });
 });
 

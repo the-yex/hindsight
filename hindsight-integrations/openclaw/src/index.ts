@@ -5,6 +5,7 @@ import type {
   PluginHookEndedTranscript,
   MemoryResult,
   RetainRequest,
+  RecallTagsMatch,
 } from "./types.js";
 import { HindsightServer, type Logger } from "@vectorize-io/hindsight-all";
 import {
@@ -169,6 +170,8 @@ export interface BankScopedClient {
       types?: Array<"world" | "experience" | "observation">;
       preferObservations?: boolean;
       minScores?: MinScores;
+      tags?: string[];
+      tagsMatch?: RecallTagsMatch;
     },
     timeoutMs?: number,
     signal?: globalThis.AbortSignal
@@ -234,6 +237,9 @@ export function scopeClient(c: HindsightClient, bankId: string): BankScopedClien
             types: req.types,
             preferObservations: req.preferObservations,
             minScores: req.minScores,
+            ...(req.tags && req.tags.length > 0
+              ? { tags: req.tags, tagsMatch: req.tagsMatch }
+              : {}),
             signal: effective,
           }),
           cancelled,
@@ -2115,6 +2121,66 @@ export function normalizeRetainTags(value: unknown): string[] {
   return normalized;
 }
 
+/** Make a tag value safe for Hindsight's tag grammar (globs use '*', so keep it and ':' '.' '@'). */
+function sanitizeTagValue(value: string): string {
+  return value
+    .trim()
+    .replace(/\s+/g, "_")
+    .replace(/[^\p{L}\p{N}_.:@*\-]/gu, "_");
+}
+
+/**
+ * Resolve `{agent}` / `{provider}` / `{channel}` / `{sender}` / `{session}`
+ * placeholders in configured tags. A tag whose placeholder cannot be resolved
+ * is dropped rather than sent half-empty (e.g. never send "speaker:").
+ */
+export function resolveScopeTags(
+  tags: unknown,
+  vars: Record<string, string | undefined>
+): string[] {
+  const resolved: string[] = [];
+  for (const tag of normalizeRetainTags(tags)) {
+    let unresolved = false;
+    const value = tag.replace(/\{([a-zA-Z][a-zA-Z0-9_]*)\}/g, (_match, name: string) => {
+      const replacement = vars[name.toLowerCase()];
+      if (!replacement) {
+        unresolved = true;
+        return "";
+      }
+      return sanitizeTagValue(replacement);
+    });
+    if (!unresolved) resolved.push(value);
+  }
+  return resolved;
+}
+
+/** The placeholder values a hook can offer to `resolveScopeTags`. */
+export function scopeTagVars(
+  ctx: PluginHookAgentContext | undefined
+): Record<string, string | undefined> {
+  const resolved = resolveSessionIdentity(ctx);
+  const parsed = resolved?.sessionKey ? parseSessionKey(resolved.sessionKey) : {};
+  const provider = resolved?.messageProvider || parsed.provider;
+  return {
+    agent: resolved?.agentId || parsed.agentId,
+    provider,
+    channel: sanitizeChannelId(resolved?.channelId, provider) || parsed.channel,
+    sender: resolved?.senderId,
+    session: resolved?.sessionKey,
+    workspace: resolved?.workspaceDir,
+  };
+}
+
+/** Whether configured recall tag filtering should be applied at all. */
+export function recallTagFilter(
+  ctx: PluginHookAgentContext | undefined,
+  pluginConfig: PluginConfig
+): { tags: string[]; tagsMatch: RecallTagsMatch } | undefined {
+  const tags = resolveScopeTags(pluginConfig.recallTags, scopeTagVars(ctx));
+  if (tags.length === 0) return undefined;
+  return { tags, tagsMatch: pluginConfig.recallTagsMatch ?? "any" };
+}
+
 export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
   const config = api.config.plugins?.entries?.["hindsight-openclaw"]?.config || {};
 
@@ -2172,6 +2238,8 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
     bankIdPrefix: config.bankIdPrefix,
     agentBankMap: normalizeAgentBankMap(config.agentBankMap),
     retainTags: normalizeRetainTags(config.retainTags),
+    recallTags: normalizeRetainTags(config.recallTags),
+    recallTagsMatch: config.recallTagsMatch,
     retainSource:
       typeof config.retainSource === "string" && config.retainSource.trim().length > 0
         ? config.retainSource.trim()
@@ -2885,9 +2953,12 @@ export default function (api: MoltbotPluginAPI) {
         debug(`[Hindsight] Auto-recall for bank ${bankId}, full query:\n---\n${prompt}\n---`);
 
         // Recall with deduplication: reuse in-flight request for same bank
+        const tagFilter = recallTagFilter(resolvedCtxForRecall, pluginConfig);
         const normalizedPrompt = prompt.trim().toLowerCase().replace(/\s+/g, " ");
         const queryHash = createHash("sha256").update(normalizedPrompt).digest("hex").slice(0, 16);
-        const recallKey = `${bankId}::${queryHash}`;
+        const recallKey = `${bankId}::${queryHash}${
+          tagFilter ? `::${tagFilter.tagsMatch}:${tagFilter.tags.join(",")}` : ""
+        }`;
         const existing = inflightRecalls.get(recallKey);
         let recallPromise: Promise<RecallResponse>;
         if (existing) {
@@ -2903,6 +2974,7 @@ export default function (api: MoltbotPluginAPI) {
               types: pluginConfig.recallTypes,
               preferObservations: pluginConfig.preferObservations,
               minScores: pluginConfig.recallMinScores,
+              ...(tagFilter ? { tags: tagFilter.tags, tagsMatch: tagFilter.tagsMatch } : {}),
             },
             recallTimeoutMs,
             recallLifecycle.signal
@@ -3447,27 +3519,48 @@ ${memoriesFormatted}
         `config names the tool ${old}, which is now ${RENAMED_TOOL_NAMES[old]}: rename it there`
       );
     }
+    // The same identity resolution auto-recall runs, so tools land on its bank
+    // and resolve the same tag placeholders.
+    const toolIdentity = (ctx: {
+      agentId?: string;
+      sessionKey?: string;
+      workspaceDir?: string;
+      requesterSenderId?: string;
+    }) => {
+      const config = currentPluginConfig || pluginConfig;
+      return {
+        config,
+        ...resolveAndCacheIdentity({
+          sessionKey: ctx.sessionKey,
+          ctx: {
+            agentId: ctx.agentId,
+            sessionKey: ctx.sessionKey,
+            workspaceDir: ctx.workspaceDir,
+          },
+          senderIdHint: ctx.requesterSenderId,
+          pluginConfig: config,
+        }),
+      };
+    };
+
     // Hermes's agent tools on this session's own bank. (#5635)
     api.registerTool?.(
       (toolCtx) =>
         createHindsightTools(
           {
             bankFor: (ctx) => {
-              const config = currentPluginConfig || pluginConfig;
-              // The same identity resolution auto-recall runs, so the tools land on its bank.
-              const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
-                sessionKey: ctx.sessionKey,
-                ctx: {
-                  agentId: ctx.agentId,
-                  sessionKey: ctx.sessionKey,
-                  workspaceDir: ctx.workspaceDir,
-                },
-                senderIdHint: ctx.requesterSenderId,
-                pluginConfig: config,
-              });
+              const { resolvedCtx, skipReason, config } = toolIdentity(ctx);
               return skipReason
                 ? { error: skipReason.detail }
                 : { bankId: deriveBankId(resolvedCtx, config) };
+            },
+            retainTagsFor: (ctx) => {
+              const { resolvedCtx, config } = toolIdentity(ctx);
+              return resolveScopeTags(config.retainTags, scopeTagVars(resolvedCtx));
+            },
+            recallTagFilterFor: (ctx) => {
+              const { resolvedCtx, config } = toolIdentity(ctx);
+              return recallTagFilter(resolvedCtx, config);
             },
             clientFor: async (bankId) => {
               const live = await readyClient();
@@ -3567,7 +3660,7 @@ export function buildRetainRequest(
   const channelType = effectiveCtx?.messageProvider;
   const threadId = extractThreadId(channelId);
   const mergedTags = normalizeRetainTags([
-    ...(pluginConfig.retainTags ?? []),
+    ...resolveScopeTags(pluginConfig.retainTags, scopeTagVars(effectiveCtx)),
     ...(options?.tags ?? []),
   ]);
 

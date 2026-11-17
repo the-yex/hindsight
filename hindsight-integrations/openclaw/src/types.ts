@@ -9,6 +9,8 @@ export interface PluginPromptHookResult {
   appendSystemContext?: string;
 }
 
+export type RecallTagsMatch = "any" | "all" | "any_strict" | "all_strict" | "exact";
+
 export interface MoltbotPluginAPI {
   config: MoltbotConfig;
   registerService(config: ServiceConfig): void;
@@ -154,7 +156,9 @@ export interface PluginConfig {
   bankId?: string; // Static bank ID used when dynamicBankId is false.
   bankIdPrefix?: string; // Prefix for bank IDs (e.g. 'prod' -> 'prod-slack-C123')
   agentBankMap?: Record<string, string>; // Explicit agentId -> bankId routing, checked before static/dynamic derivation. Lets a group of agents share one named bank while others keep derived banks. Mapped names are used exactly as given (bankIdPrefix is not applied).
-  retainTags?: string[]; // Tags applied to all retained documents after trimming and deduplication; auto-retain merges these with inline per-message retain-tag directives (e.g. ['source_system:openclaw', 'agent:agentname'])
+  retainTags?: string[]; // Tags applied to all retained documents after trimming and deduplication; auto-retain merges these with inline per-message retain-tag directives (e.g. ['source_system:openclaw', 'agent:agentname']). Supports session placeholders {agent} {provider} {channel} {sender} {session}: e.g. 'speaker:{sender}'.
+  recallTags?: string[]; // Optional tag filter applied to auto-recall and hindsight_recall. Same placeholders as retainTags: e.g. ['speaker:{sender}']. Tags without placeholders are passed literally. When empty/unset, recall is unfiltered.
+  recallTagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact"; // How recallTags must match. Default: 'any' — the Hindsight default, which also returns untagged memories, so pre-existing memories and untagged global facts stay visible.
   retainSource?: string; // Source written into retained document metadata (default: 'openclaw')
   retainContext?: string; // Interpretation guidance sent via the retain API context field. Defaults to built-in OpenClaw transcript/routing metadata guidance.
   excludeProviders?: string[]; // Message providers to exclude from recall/retain (e.g. ['telegram', 'discord'])

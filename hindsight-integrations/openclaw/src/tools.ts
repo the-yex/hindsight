@@ -10,7 +10,13 @@
  */
 import { HindsightError, type HindsightClient } from "@vectorize-io/hindsight-client";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
-import type { PluginConfig, PluginTool, PluginToolContext, PluginToolResult } from "./types.js";
+import type {
+  PluginConfig,
+  PluginTool,
+  PluginToolContext,
+  PluginToolResult,
+  RecallTagsMatch,
+} from "./types.js";
 
 // The page tools mirror Hindsight's own MCP tools of the same names
 // (hindsight_api/mcp_tools.py), on the session's bank. Deleting needs
@@ -64,6 +70,12 @@ export interface HindsightToolDeps {
   /** The ready client, with the configured bank defaults applied to `bankId`. */
   clientFor(bankId: string): Promise<HindsightClient>;
   config(): PluginConfig;
+  /** Configured retain tags with session placeholders resolved for this call. */
+  retainTagsFor(ctx: PluginToolContext): string[];
+  /** Configured recall tag filter with session placeholders resolved, or undefined. */
+  recallTagFilterFor(
+    ctx: PluginToolContext
+  ): { tags: string[]; tagsMatch: RecallTagsMatch } | undefined;
 }
 
 const NOTHING_FOUND = "No relevant memories found.";
@@ -180,7 +192,7 @@ export function createHindsightTools(
         const callTags = Array.isArray(params.tags)
           ? params.tags.filter((t): t is string => typeof t === "string").map((t) => t.trim())
           : [];
-        const tags = [...new Set([...(config.retainTags ?? []), ...callTags].filter(Boolean))];
+        const tags = [...new Set([...deps.retainTagsFor(ctx), ...callTags].filter(Boolean))];
         const occurredAt = typeof params.occurred_at === "string" ? params.occurred_at.trim() : "";
         await client.retain(bankId, content, {
           context: typeof params.context === "string" ? params.context : undefined,
@@ -215,12 +227,14 @@ export function createHindsightTools(
         const { bankId, client } = await bank();
         try {
           // The same settings auto-recall uses, so the tool sees what auto-recall would.
+          const tagFilter = deps.recallTagFilterFor(ctx);
           const response = await client.recall(bankId, query, {
             maxTokens: config.recallMaxTokens,
             budget: config.recallBudget,
             types: config.recallTypes,
             preferObservations: config.preferObservations,
             minScores: config.recallMinScores,
+            ...(tagFilter ? { tags: tagFilter.tags, tagsMatch: tagFilter.tagsMatch } : {}),
             signal,
           });
           const lines = (response.results ?? []).map((r, i) => `${i + 1}. ${r.text}`);
