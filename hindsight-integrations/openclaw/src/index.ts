@@ -2155,6 +2155,15 @@ export function resolveScopeTags(
 }
 
 /** The placeholder values a hook can offer to `resolveScopeTags`. */
+/** Strip transport qualifiers so chat tags name the peer, not the route. */
+function normalizeChatChannel(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const stripped = value
+    .replace(/^bridge:/i, "")
+    .replace(/^(direct|group|channel|user):/i, "");
+  return stripped.length > 0 ? stripped : undefined;
+}
+
 export function scopeTagVars(
   ctx: PluginHookAgentContext | undefined
 ): Record<string, string | undefined> {
@@ -2164,7 +2173,9 @@ export function scopeTagVars(
   return {
     agent: resolved?.agentId || parsed.agentId,
     provider,
-    channel: sanitizeChannelId(resolved?.channelId, provider) || parsed.channel,
+    channel: normalizeChatChannel(
+      sanitizeChannelId(resolved?.channelId, provider) || parsed.channel
+    ),
     sender: resolved?.senderId,
     session: resolved?.sessionKey,
     workspace: resolved?.workspaceDir,
