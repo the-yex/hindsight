@@ -27,7 +27,7 @@ import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
 import * as log from "./logger.js";
 import { configureLogger, setApiLogger, stopLogger } from "./logger.js";
-import { mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { createRequire } from "module";
 import { homedir } from "os";
 import {
@@ -2164,8 +2164,89 @@ function normalizeChatChannel(value: string | undefined): string | undefined {
   return stripped.length > 0 ? stripped : undefined;
 }
 
-export function scopeTagVars(
+/** Parse the chat display name from the header the bridge puts on every transcript. */
+export function parseChatName(transcript: string | undefined): string | undefined {
+  if (!transcript) return undefined;
+  const head = transcript.slice(0, 4000);
+  const direct = head.match(/\[Direct chat with ([^;\]]+); you are /);
+  if (direct?.[1]) return direct[1].trim() || undefined;
+  const group = head.match(/\[Group chat "([^"]+)"[;\]]/);
+  if (group?.[1]) return group[1].trim() || undefined;
+  return undefined;
+}
+
+const CHAT_NAME_FILE = "hindsight-chat-names.json";
+let chatNameCache: Record<string, string> | undefined;
+
+function chatNamesPath(): string {
+  return join(homedir(), ".openclaw", "data", CHAT_NAME_FILE);
+}
+
+function chatNameKey(provider?: string, channel?: string): string | undefined {
+  return provider && channel ? `${provider}:${channel}` : undefined;
+}
+
+function loadChatNames(): Record<string, string> {
+  if (chatNameCache) return chatNameCache;
+  const names: Record<string, string> = {};
+  try {
+    if (existsSync(chatNamesPath())) {
+      const parsed: unknown = JSON.parse(readFileSync(chatNamesPath(), "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+          if (typeof value === "string" && value.trim()) names[key] = value.trim();
+        }
+      }
+    }
+  } catch {
+    // A corrupt cache only costs a `name:` tag; never fail a retain over it.
+  }
+  chatNameCache = names;
+  return names;
+}
+
+/** Remember the display name a chat introduced itself with, so later turns keep the tag. */
+export function rememberChatName(
+  provider: string | undefined,
+  channel: string | undefined,
+  name: string | undefined
+): void {
+  const key = chatNameKey(provider, channel);
+  const clean = name?.trim();
+  if (!key || !clean) return;
+  const names = loadChatNames();
+  if (names[key] === clean) return;
+  names[key] = clean;
+  try {
+    const path = chatNamesPath();
+    mkdirSync(dirname(path), { recursive: true });
+    const tmp = `${path}.tmp`;
+    writeFileSync(tmp, JSON.stringify(names, null, 0) + "\n", { mode: 0o600 });
+    renameSync(tmp, path);
+  } catch (err) {
+    log.verbose(`failed to persist chat names: ${String(err)}`);
+  }
+}
+
+export function lookupChatName(
+  provider?: string,
+  channel?: string
+): string | undefined {
+  const key = chatNameKey(provider, channel);
+  return key ? loadChatNames()[key] : undefined;
+}
+
+/** Tag placeholders for a retain, including the chat display name when known. */
+export function retentionTagVars(
   ctx: PluginHookAgentContext | undefined
+): Record<string, string | undefined> {
+  const vars = scopeTagVars(ctx);
+  return { ...vars, chatname: lookupChatName(vars.provider, vars.channel) };
+}
+
+export function scopeTagVars(
+  ctx: PluginHookAgentContext | undefined,
+  chatName?: string
 ): Record<string, string | undefined> {
   const resolved = resolveSessionIdentity(ctx);
   const parsed = resolved?.sessionKey ? parseSessionKey(resolved.sessionKey) : {};
@@ -2179,6 +2260,7 @@ export function scopeTagVars(
     sender: resolved?.senderId,
     session: resolved?.sessionKey,
     workspace: resolved?.workspaceDir,
+    chatname: chatName,
   };
 }
 
@@ -3567,7 +3649,7 @@ ${memoriesFormatted}
             },
             retainTagsFor: (ctx) => {
               const { resolvedCtx, config } = toolIdentity(ctx);
-              return resolveScopeTags(config.retainTags, scopeTagVars(resolvedCtx));
+              return resolveScopeTags(config.retainTags, retentionTagVars(resolvedCtx));
             },
             recallTagFilterFor: (ctx) => {
               const { resolvedCtx, config } = toolIdentity(ctx);
@@ -3670,8 +3752,13 @@ export function buildRetainRequest(
   const channelId = sanitizeChannelId(effectiveCtx?.channelId, provider) || parsedSession.channel;
   const channelType = effectiveCtx?.messageProvider;
   const threadId = extractThreadId(channelId);
+  // The name cache is keyed by the normalized chat id (same value `{channel}`
+  // resolves to), so recall and retain always look at the same entry.
+  const chatChannel = normalizeChatChannel(channelId);
+  const chatName = parseChatName(transcript) ?? lookupChatName(provider, chatChannel);
+  if (chatName) rememberChatName(provider, chatChannel, chatName);
   const mergedTags = normalizeRetainTags([
-    ...resolveScopeTags(pluginConfig.retainTags, scopeTagVars(effectiveCtx)),
+    ...resolveScopeTags(pluginConfig.retainTags, retentionTagVars(effectiveCtx)),
     ...(options?.tags ?? []),
   ]);
 

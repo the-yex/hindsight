@@ -31,6 +31,7 @@ import {
   isEphemeralOperationalText,
   deriveBankId,
   normalizeRetainTags,
+  parseChatName,
   resolveScopeTags,
   recallTagFilter,
   extractInlineRetainTags,
@@ -501,6 +502,32 @@ describe("resolveScopeTags", () => {
 
   it("returns an empty list when nothing is configured", () => {
     expect(resolveScopeTags(undefined, { sender: "x" })).toEqual([]);
+  });
+
+  it("substitutes the chat display name placeholder", () => {
+    expect(resolveScopeTags(["name:{chatName}"], { chatname: "电商&风格专项小组" })).toEqual([
+      "name:电商_风格专项小组",
+    ]);
+    expect(resolveScopeTags(["name:{chatName}"], {})).toEqual([]);
+  });
+});
+
+describe("parseChatName", () => {
+  it("reads the direct-chat sender name from the transcript header", () => {
+    expect(
+      parseChatName('[Direct chat with 明哥; you are 跳跳不吃鱼]\n明哥: 在吗')
+    ).toBe("明哥");
+  });
+
+  it("reads the group name from the transcript header", () => {
+    expect(
+      parseChatName('[Group chat "电商&风格专项小组"; you are 跳跳不吃鱼]\nmortal: @跳跳不吃鱼 在吗')
+    ).toBe("电商&风格专项小组");
+  });
+
+  it("returns undefined when the transcript has no header", () => {
+    expect(parseChatName("mortal: 在吗")).toBeUndefined();
+    expect(parseChatName(undefined)).toBeUndefined();
   });
 });
 
