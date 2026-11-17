@@ -1768,9 +1768,10 @@ DEFAULT_RECALL_DECISION_MODEL_DEDUP = False
 # failing decision model fails the recall unless the operator chose the fallback.
 DEFAULT_RECALL_DECISION_MODEL_FALLBACK = False
 # Knowledge-bank search reranks this many of its best hits with the decision model (when one is set up
-# for it); the rest keep the search's order. Jev on the top 30 took ViDoRe v3 NDCG@10 from 59.4 to 66.8;
-# ATM-Bench R@10 from 85.3 to 89.2, and to 90.9 at 100.
-DEFAULT_KNOWLEDGE_DECISION_MODEL_CANDIDATES = 30
+# for it); the rest keep the search's order. Offline, Jev on ATM-Bench took R@10 from 85.3 to 89.2 on the
+# top 30 and to 90.9 on the top 100 (the top 100 hold 95% of the wanted items, the top 30 91%); recall's
+# reranker takes 300 (HINDSIGHT_API_RERANKER_MAX_CANDIDATES), but each hit here can be an image request.
+DEFAULT_KNOWLEDGE_DECISION_MODEL_CANDIDATES = 100
 
 
 def _decision_model_env(operation: str, setting: str) -> str:
